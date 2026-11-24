@@ -638,6 +638,24 @@
     const HARI_ID = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
     const BULAN_ID = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'];
 
+    const WRITE_FUNCTIONS = new Set([
+      'saveRecord',
+      'deleteRecord',
+      'toggleUjianStatus',
+      'saveNotulensi',
+      'saveNotulensiArchive',
+      'deleteNotulensiArchive'
+    ]);
+
+    function formatTimeOnly(val) {
+      if (!val) return '';
+      const str = String(val).trim();
+      const match = str.match(/(\d{1,2}:\d{2})/);
+      if (!match) return str;
+      const parts = match[1].split(':');
+      return `${String(parts[0]).padStart(2, '0')}:${parts[1]}`;
+    }
+
     function parseSheetDate(val) {
       if (!val) return new Date(NaN);
       if (val instanceof Date) return val;
@@ -776,6 +794,24 @@
       const encodedArgs = encodeURIComponent(JSON.stringify(args || []));
       const getUrl = `${GAS_WEBAPP_URL}${sep}action=${encodeURIComponent(fnName)}&args=${encodedArgs}&_t=${Date.now()}`;
 
+      if (WRITE_FUNCTIONS.has(fnName)) {
+        try {
+          const postRes = await fetch(GAS_WEBAPP_URL, {
+            method: 'POST',
+            redirect: 'follow',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({ action: fnName, args: args || [] })
+          });
+          if (postRes.ok) {
+            const text = await postRes.text();
+            try {
+              const parsed = JSON.parse(text);
+              if (parsed && typeof parsed === 'object') return parsed;
+            } catch (e) {}
+          }
+        } catch (postErr) {}
+      }
+
       try {
         const res = await fetch(getUrl, {
           method: 'GET',
@@ -819,7 +855,7 @@
         if (APP_STATE.role && !isUserTypingInForm() && document.visibilityState === 'visible') {
           syncDataFromSheet(true);
         }
-      }, 3000);
+      }, 5000);
     }
 
     window.addEventListener('online', () => {
@@ -967,13 +1003,20 @@
           APP_STATE.isSyncing = false;
           if (icon) icon.classList.remove('animate-spin');
           if (res && res.success) {
+            ensureNotulensiStore();
             const sheetPelajaran = Array.isArray(res.pelajaran) ? res.pelajaran : [];
+            const sheetNotulensi = Array.isArray(res.notulensi) ? res.notulensi : [];
+            const localNotulensi = APP_STATE.data.notulensi || [];
+
+            // Pertahankan notulensi lokal jika sheet belum mengembalikan atau sedang kosong
+            const mergedNotulensi = sheetNotulensi.length > 0 ? sheetNotulensi : localNotulensi;
+
             APP_STATE.data = {
               agenda: Array.isArray(res.agenda) ? res.agenda : [],
               pelajaran: sheetPelajaran.length > 0 ? sheetPelajaran : DEFAULT_PELAJARAN_SEED.slice(),
               ujian: Array.isArray(res.ujian) ? res.ujian : [],
               tugas: Array.isArray(res.tugas) ? res.tugas : [],
-              notulensi: Array.isArray(res.notulensi) ? res.notulensi : []
+              notulensi: mergedNotulensi
             };
             saveLocalCache();
             renderAllUI();
@@ -1005,7 +1048,7 @@
       if (RETRY_SYNC_TIMER) clearTimeout(RETRY_SYNC_TIMER);
       RETRY_SYNC_TIMER = setTimeout(() => {
         if (APP_STATE.role && !APP_STATE.isSyncing) syncDataFromSheet(true);
-      }, 2000);
+      }, 2500);
     }
 
     function applyOptimisticSave(sheetName, payload) {
@@ -1229,8 +1272,9 @@
       } else {
         const allTodayLessons = (APP_STATE.data.pelajaran || []).filter((p) => p.Hari === todayName);
         const todayLessons = allTodayLessons.filter((p) => {
-          if (!p.WaktuSelesai) return true;
-          const [hh, mm] = p.WaktuSelesai.split(':').map(Number);
+          const selesaiClean = formatTimeOnly(p.WaktuSelesai);
+          if (!selesaiClean) return true;
+          const [hh, mm] = selesaiClean.split(':').map(Number);
           return (hh * 60 + mm) > currentMinutes;
         });
 
@@ -1240,11 +1284,13 @@
           todayBox.innerHTML = `<div class="p-4 rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-300 font-extrabold text-xs text-center">TERIMAKASIH TELAH BELAJAR DENGAN BAIK,,SAATNYA PULANG,HATI HATI DIJALAN</div>`;
         } else {
           todayBox.innerHTML = todayLessons.map((p) => {
+            const mulaiClean = formatTimeOnly(p.WaktuMulai);
+            const selesaiClean = formatTimeOnly(p.WaktuSelesai);
             const hasTask = (APP_STATE.data.tugas || []).some((t) => t.NamaMapel.toLowerCase() === p.NamaMapel.toLowerCase());
             return `
               <div class="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 flex items-center justify-between gap-2">
                 <div>
-                  <span class="text-[11px] font-bold text-blue-600 dark:text-blue-400">${p.WaktuMulai} - ${p.WaktuSelesai}</span>
+                  <span class="text-[11px] font-bold text-blue-600 dark:text-blue-400">${mulaiClean} - ${selesaiClean}</span>
                   <p class="font-bold text-sm text-slate-900 dark:text-white">${p.NamaMapel}</p>
                   <p class="text-xs text-slate-500 dark:text-slate-400">Guru: ${p.NamaGuru}</p>
                 </div>
@@ -1265,7 +1311,7 @@
       } else {
         tomorrowBox.innerHTML = tomorrowItems.map((item) => {
           const mapel = item.NamaMapel;
-          const waktu = isExamMode ? item.Jam : `${item.WaktuMulai} - ${item.WaktuSelesai}`;
+          const waktu = isExamMode ? item.Jam : `${formatTimeOnly(item.WaktuMulai)} - ${formatTimeOnly(item.WaktuSelesai)}`;
           const hasTask = (APP_STATE.data.tugas || []).some((t) => t.NamaMapel.toLowerCase() === mapel.toLowerCase());
           return `
             <div class="p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 flex items-center justify-between">
@@ -1352,7 +1398,7 @@
         'saveRecord',
         [sheetName, payload, pin],
         (res) => {
-          setTimeout(() => syncDataFromSheet(true), 600);
+          setTimeout(() => syncDataFromSheet(true), 800);
           onDone(res || { success: true, message: 'Tersimpan & tersinkron!' });
         },
         () => {
@@ -1443,7 +1489,7 @@
           'deleteRecord',
           [sheetName, id, pin],
           (res) => {
-            setTimeout(() => syncDataFromSheet(true), 600);
+            setTimeout(() => syncDataFromSheet(true), 800);
             showToast((res && res.message) || 'Data dihapus');
           },
           () => scheduleRetrySync()
@@ -1464,7 +1510,7 @@
           'toggleUjianStatus',
           [id, nextStatus, pin],
           (res) => {
-            setTimeout(() => syncDataFromSheet(true), 600);
+            setTimeout(() => syncDataFromSheet(true), 800);
             showToast((res && res.message) || 'Status ujian diperbarui');
           },
           () => scheduleRetrySync()
@@ -1490,7 +1536,7 @@
       document.getElementById('table-pelajaran-body').innerHTML = (APP_STATE.data.pelajaran || []).map((p) => `
         <tr>
           <td class="p-3 font-bold">${p.Hari}</td>
-          <td class="p-3">${p.WaktuMulai} - ${p.WaktuSelesai}</td>
+          <td class="p-3">${formatTimeOnly(p.WaktuMulai)} - ${formatTimeOnly(p.WaktuSelesai)}</td>
           <td class="p-3 font-bold">${p.NamaMapel}</td>
           <td class="p-3">${p.NamaGuru}</td>
           <td class="p-3 text-right space-x-1">
@@ -1553,8 +1599,8 @@
       document.getElementById('pelajaran-mapel').value = p.NamaMapel || '';
       document.getElementById('pelajaran-guru').value = p.NamaGuru || '';
       document.getElementById('pelajaran-hari').value = p.Hari || 'Senin';
-      document.getElementById('pelajaran-mulai').value = p.WaktuMulai || '';
-      document.getElementById('pelajaran-selesai').value = p.WaktuSelesai || '';
+      document.getElementById('pelajaran-mulai').value = formatTimeOnly(p.WaktuMulai);
+      document.getElementById('pelajaran-selesai').value = formatTimeOnly(p.WaktuSelesai);
     }
 
     function editUjianById(id) {
@@ -1627,7 +1673,7 @@
           'deleteNotulensiArchive',
           [id, pin],
           (res) => {
-            setTimeout(() => syncDataFromSheet(true), 600);
+            setTimeout(() => syncDataFromSheet(true), 800);
             showToast((res && res.message) || 'Notulensi berhasil dihapus!');
           },
           () => scheduleRetrySync()
@@ -1769,7 +1815,7 @@
       }
 
       closeModal('modal-signature-pdf');
-      showToast('Menyimpan Notulensi ke Spreadsheet & membuat PDF...');
+      showToast('Menyimpan Notulensi ke Dashboard & Spreadsheet...');
 
       const tokenTte = await getActiveTteTokenAsync();
       const [logoDataUrl, qrTteDataUrl] = await Promise.all([
@@ -1781,8 +1827,6 @@
       const tglCetak = now.toLocaleString('id-ID');
       const docId = editId || ('NOT-' + now.getFullYear() + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0') + '-' + Math.floor(1000 + Math.random() * 9000));
 
-      if (agendaId) callServer('saveNotulensi', [agendaId, isi], null, null);
-
       const archiveRecord = {
         ID: docId,
         AgendaID: agendaId || '',
@@ -1790,23 +1834,44 @@
         Isi: isi,
         TokenTTE: tokenTte,
         Penandatangan: 'Muhammad Sufyan Fahriza',
-        Jabatan: '',
+        Jabatan: 'Eselon III (Pejabat Rohis)',
         Tanggal: tglCetak
       };
 
+      // 1. Simpan ke state & cache lokal agar langsung muncul di Dashboard & Arsip
       const existingIdx = APP_STATE.data.notulensi.findIndex((x) => String(x.ID) === String(docId));
       if (existingIdx >= 0) APP_STATE.data.notulensi[existingIdx] = archiveRecord;
       else APP_STATE.data.notulensi.unshift(archiveRecord);
+
+      if (agendaId) {
+        const ag = (APP_STATE.data.agenda || []).find((a) => String(a.ID) === String(agendaId));
+        if (ag) ag.Notulensi = isi;
+      }
+
       saveLocalCache();
       renderDashboardNotulensi();
       renderNotulensiArchive();
 
+      // 2. Kirim ke Google Apps Script (saveNotulensiArchive + fallback saveRecord('Notulensi', ...))
+      if (agendaId) {
+        callServer('saveNotulensi', [agendaId, isi], null, null);
+      }
+
       callServer(
         'saveNotulensiArchive',
         [archiveRecord],
-        () => setTimeout(() => syncDataFromSheet(true), 600),
-        () => scheduleRetrySync()
+        (res) => {
+          if (!res || res.success === false) {
+            callServer('saveRecord', ['Notulensi', archiveRecord, ''], null, null);
+          }
+          setTimeout(() => syncDataFromSheet(true), 800);
+        },
+        () => {
+          callServer('saveRecord', ['Notulensi', archiveRecord, ''], null, null);
+          scheduleRetrySync();
+        }
       );
+
       resetNotulensiForm();
 
       if (window.jspdf && window.jspdf.jsPDF) {
@@ -1900,7 +1965,7 @@
         doc.save(`Notulensi_${judul.replace(/[^a-zA-Z0-9_-]/g, '_')}_${docId}.pdf`);
       }
 
-      showToast(`PDF Notulensi dibuat & disimpan (Token: ${tokenTte})`);
+      showToast(`Notulensi tersimpan & PDF dibuat (Token: ${tokenTte})`);
     }
 
     function renderNotulensiArchive() {
